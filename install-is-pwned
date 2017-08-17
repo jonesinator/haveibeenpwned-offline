@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# This script downloads the password list files from haveibeenpwned.com and
+# installs another script that can be used to query those lists for any given
+# password to see if it has been compromised. The script assumes 7zr, wget, and
+# sha1sum are installed. The script will not redownload files if they have
+# already been downloaded and are valid. This script passes shellcheck, please
+# keep it that way.
+set +h
+
+# Script configuration variables can be overridden by environment variables.
+: "${IS_PWNED_SCRIPT_NAME:=is-pwned}"
+: "${IS_PWNED_SCRIPT_PATH:=/usr/local/bin}"
+: "${IS_PWNED_DATA_NAME:=pwned-passwords}"
+: "${IS_PWNED_DATA_PATH:=/usr/local/share/is-pwned}"
+: "${IS_PWNED_URL_PREFIX:=https://downloads.pwnedpasswords.com/passwords}"
+: "${IS_PWNED_ITEMS:=\
+pwned-passwords-1.0.txt.7z:90d57d16a2dfe00de6cc58d0fa7882229ace4a53 \
+pwned-passwords-update-1.txt.7z:00fc585efad08a4b6323f8e4196aae9207f8b09f \
+pwned-passwords-update-2.txt.7z:20318090278bbd196945025bc7bf93e99f261f9a}"
+: "${IS_PWNED_EXPECTED_HASH:=389c3f37a9af84f17161135ad00bd32a7bd34643}"
+: "${IS_PWNED_DOWNLOAD_MAX_RETRIES:=5}"
+: "${IS_PWNED_CLEAN_UP_COMPRESSED_FILES:=false}"
+
+function log {
+  echo "$(date): " "$@" >&2
+}
+
+function die {
+  log "ERROR: " "$@" >&2
+  exit 1
+}
+
+function require_command {
+  command -v "$1" > /dev/null 2>&1 ||
+    die "$1 command not found. Please install it and try again."
+}
+
+require_command 7zr
+require_command wget
+require_command sha1sum
+
+# Create target directories.
+mkdir -p "${IS_PWNED_SCRIPT_PATH}" ||
+  die "Cannot create directory ${IS_PWNED_SCRIPT_PATH}. (maybe try sudo?)."
+mkdir -p "${IS_PWNED_DATA_PATH}" ||
+  die "Cannot create directory ${IS_PWNED_DATA_PATH}. (maybe try sudo?)."
+
+# Confirm we have read/write permissions for the target directories.
+[[ -r "${IS_PWNED_SCRIPT_PATH}" && -w "${IS_PWNED_SCRIPT_PATH}" ]] ||
+  die "Insufficent permissions for ${IS_PWNED_SCRIPT_PATH}. (maybe try sudo?)."
+[[ -r "${IS_PWNED_DATA_PATH}" && -w "${IS_PWNED_DATA_PATH}" ]] ||
+  die "Insufficent permissions for ${IS_PWNED_SCRIPT_PATH}. (maybe try sudo?)."
+
+# Check if the concatenated data file already exists and is valid.
+cd "${IS_PWNED_DATA_PATH}" || die "Can't cd to ${IS_PWNED_DATA_PATH}"
+if [ -f "${IS_PWNED_DATA_NAME}" ]; then
+  log "Validating hash for existing ${IS_PWNED_DATA_NAME}."
+  actual_hash=$(sha1sum "${IS_PWNED_DATA_NAME}" | cut -d' ' -f1)
+  if [ "${actual_hash}" == "${IS_PWNED_EXPECTED_HASH}" ]; then
+    log "Hash for ${IS_PWNED_DATA_NAME} is valid. Skipping downloads."
+  else
+    log "Hash for ${IS_PWNED_DATA_NAME} is invalid."
+    rm "${IS_PWNED_DATA_NAME}" || die "Can't rm ${IS_PWNED_DATA_NAME}."
+  fi
+fi
+
+# The master file did not exist or was not valid. Download the files.
+if [ ! -f "${IS_PWNED_DATA_NAME}" ]; then
+  for pwned_item in ${IS_PWNED_ITEMS}; do
+    # Extract the filename and hash from the item string.
+    pwned_file=$(echo "${pwned_item}" | cut -d':' -f1)
+    pwned_hash=$(echo "${pwned_item}" | cut -d':' -f2)
+
+    # Determine if we already have a valid compressed file.
+    valid_download=false
+    if [ -f "${pwned_file}" ]; then
+      log "File ${pwned_file} already exists. Validating hash."
+      actual_hash=$(sha1sum "${pwned_file}" | cut -d' ' -f1)
+      if [ "${actual_hash}" == "${pwned_hash}" ]; then
+        log "File ${pwned_file} has a valid hash. Skipping download."
+        valid_download=true
+      else
+        log "File ${pwned_file} has an invalid hash."
+      fi
+    fi
+
+    # We either don't have the file at all or we have a partial file. Download
+    # the file. Once the file is downloaded, make sure it is valid. The servers
+    # on which the password lists are stored do not allow resuming downloads.
+    if ! ${valid_download}; then
+      log "Downloading ${pwned_file}."
+      wget --progress=bar:force --tries "${IS_PWNED_DOWNLOAD_MAX_RETRIES}" \
+        "${IS_PWNED_URL_PREFIX}/${pwned_file}"
+      log "Validating hash of ${pwned_file}."
+      actual_hash=$(sha1sum "${pwned_file}" | cut -d' ' -f1)
+      [ "${actual_hash}" != "${pwned_hash}" ] &&
+        die "ERROR: Download corrupted or incomplete."
+      log "Hash for ${pwned_file} is valid."
+    fi
+
+    # Now we have the file. Extract it, concatenate it with the master file,
+    # and then clean up.
+    log "Extracting ${pwned_file}."
+    7zr -bso2 -aoa x "${pwned_file}" 2>/dev/null ||
+      die "Can't extract ${pwned_file}."
+    log "Concatenating ${pwned_file} into ${IS_PWNED_DATA_NAME}."
+    cat "${pwned_file%.*}" >> "${IS_PWNED_DATA_NAME}" ||
+      die "Can't concatenate ${pwned_file%.*} into ${IS_PWNED_DATA_NAME}."
+    log "Cleaning up ${pwned_file%.*}."
+    rm "${pwned_file%.*}" || die "Can't clean up ${pwned_file%.*}."
+    if ${IS_PWNED_CLEAN_UP_COMPRESSED_FILES}; then
+      log "Cleaning up ${pwned_file}."
+      rm "${pwned_file}" || die "Can't clean up ${pwned_file}".
+    fi
+  done
+
+  # Validate the final hash of the concatenated file.
+  log "Validating hash for ${IS_PWNED_DATA_NAME}."
+  actual_hash=$(sha1sum "${IS_PWNED_DATA_NAME}" | cut -d' ' -f1)
+  if [ "${actual_hash}" == "${IS_PWNED_EXPECTED_HASH}" ]; then
+    log "Hash for ${IS_PWNED_DATA_NAME} is valid."
+  else
+    die "Hash for ${IS_PWNED_DATA_NAME} is invalid after valid downloads!"
+  fi
+fi
+
+log "Installing ${IS_PWNED_SCRIPT_PATH}/${IS_PWNED_SCRIPT_NAME}."
+cat << EOF > "${IS_PWNED_SCRIPT_PATH}/${IS_PWNED_SCRIPT_NAME}"
+#!/usr/bin/env bash
+
+DATABASE=${IS_PWNED_DATA_PATH}/${IS_PWNED_DATA_NAME}
+[[ ! -r \${DATABASE} ]] &&
+  { echo "Cannot read password database \${DATABASE}."; exit 1; }
+
+# Get the password to check.
+unset \${PASSWORD}
+while [[ -z \${PASSWORD} ]]; do
+  echo -n "Password to check: " && read -s PASSWORD1 && printf "\\n"
+  echo -n "Password to check (again): " && read -s PASSWORD2 && printf "\\n"
+  [[ "\${PASSWORD1}" == "\${PASSWORD2}" ]] &&
+    PASSWORD="\${PASSWORD1}" || echo -e "Passwords don't match! Try again...\\n"
+done
+
+# Check the password.
+PASSWORD_HASH=\$(echo -n "\${PASSWORD}" | sha1sum | cut -d' ' -f1 | tr a-z A-Z)
+echo "Checking database...(this could take a while)"
+LC_ALL=C fgrep -q -m 1 "\${PASSWORD_HASH}" "\${DATABASE}"
+
+# Display the result.
+if [ \$? -eq 0 ]; then
+  echo "This password has been pwned!"
+  exit 1
+else
+  echo "This password is not in the database."
+fi
+EOF
+chmod +x "${IS_PWNED_SCRIPT_PATH}/${IS_PWNED_SCRIPT_NAME}" ||
+  die "Could not make script executable."
+log "Installation complete!"
